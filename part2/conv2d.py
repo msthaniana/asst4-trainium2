@@ -59,7 +59,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     # Initialize output array
     X_out = nl.ndarray(
-        shape=(batch_size, out_channels, out_pool_height, out_pool_width),
+        shape=(batch_size, out_channels, out_pool_height*out_pool_width),
         dtype=X.dtype,
         buffer=nl.hbm,
     )
@@ -88,7 +88,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         nisa.dma_copy(src=X_re[b], dst=image_sbuf)
 
         # Allocate result tensor in PSUM
-        res_psum = nl.zeros((out_height * out_width, out_channels), dtype=X.dtype, buffer=nl.psum)
+        res_psum = nl.zeros((out_channels, out_height * out_width), dtype=X.dtype, buffer=nl.psum)
 
         # Iterate over every element of the filter
         for i in nl.affine_range(filter_height):
@@ -103,28 +103,27 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 # Shift input image - not sure if this flattened filter approach works
                 image_sbuf_row_start = i*filter_width + j
                 image_sbuf_row_end   = image_sbuf_row_start + out_height * out_width
-                res_psum += nisa.nc_matmul(image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end], weights_ijT_sbuf)
+                res_psum += nisa.nc_matmul(weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #changed as the left hand side should be transposed for performance i think?
 
         # Move result to SBUF
         res_sbuf = nisa.tensor_copy(res_psum)
 
         # Transpose result to get [out_channels, out_height * out_width]
-        res_psum_T = nisa.nc_transpose(res_sbuf)
+        # res_psum_T = nisa.nc_transpose(res_sbuf)
 
         # Move result to SBUF
-        res_sbuf_T = nisa.tensor_copy(res_psum_T)
+        # res_sbuf_T = nisa.tensor_copy(res_psum_T)
 
         # Move result to HBM
-        X_out_temp = nl.ndarray((out_channels, out_height * out_width), dtype=X.dtype, buffer=nl.hbm)
-        nisa.dma_copy(src=res_sbuf_T, dst=X_out_temp)
+        # X_out_temp = nl.ndarray((out_channels, out_height * out_width), dtype=X.dtype, buffer=nl.hbm)
+        nisa.dma_copy(src=res_sbuf, dst=X_out[b,:,:]) #do the reshape at the absolute end
 
         # Reshape result to match expected dimensions
         # This portion does not work
-        X_out[b,...] = X_out_temp.reshape((out_channels, out_pool_height, out_pool_width))
+        # X_out[b,:,:,:] = X_out_temp.reshape((out_channels, out_pool_height, out_pool_width))
 
         #raise RuntimeError("Please fill your implementation of computing convolution"
         #                   " of X[b] with the weights W and bias b, followed by a"
         #                   " maxpool and store the result in X_out[b]")
 
-    return X_out
-
+    return X_out.reshape((batch_size, out_channels, out_pool_height, out_pool_width))
