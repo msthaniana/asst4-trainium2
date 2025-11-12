@@ -90,9 +90,10 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         # Allocate result tensor in PSUM
         res_psum = nl.zeros((out_height * out_width,out_channels), dtype=X.dtype, buffer=nl.psum)
 
+        current_input_width = input_width
         # Iterate over every element of the filter
-        for i in nl.affine_range(filter_height):
-            for j in nl.affine_range(filter_width):
+        for j in nl.affine_range(filter_width):
+            for i in nl.affine_range(filter_height):
                 # Generate weights matrix
                 # this is an attempt to pick out one set of elements from each filter, and then transpose to get
                 # the right dimensions for nc_matmul
@@ -103,9 +104,19 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 weights_ijT_sbuf = nisa.tensor_copy(weights_ijT)
 
                 # Shift input image - not sure if this flattened filter approach works
-                image_sbuf_row_start = i*filter_width + j
+                image_sbuf_row_start = i*current_input_width
                 image_sbuf_row_end   = image_sbuf_row_start + out_height * out_width
                 res_psum += nisa.nc_matmul( image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end], weights_ijT_sbuf) #input already in transposed format
+            
+            #shift the image everytime we move the width #Likely very inefficient but maybe a good starting point.
+            next_input_width = current_input_width - 1
+            for r in nl.affine_range(input_height):
+                # image_sbuf[:,(r*(next_input_width)):((r+1)*(next_input_width))] = image_sbuf[:,(r*current_input_width+j):(r*current_input_width+current_input_width)]
+                #slicing in ranges does not work at all in the nki system hence specific values to be used
+                for c in nl.affine_range(next_input_width):
+                    image_sbuf[:,(r*(next_input_width)+c)] = image_sbuf[:,(r*current_input_width+1+c)] #image buffer itself is updated to move right by 1
+            
+            current_input_width = next_input_width
 
         # Move result to SBUF
         res_sbuf = nisa.tensor_copy(res_psum)
