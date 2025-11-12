@@ -84,6 +84,8 @@ def test_correctness_conv2d_kernel(
                         out_ref = ref_impl(*args, **kwargs)
 
                         if not np.allclose(out, out_ref):
+                            print(out[0,0])
+                            print(out_ref[0,0])
                             print(
                                 f"Output mismatch for {input_channels=}, {output_channels=}, {kernel_size=}, "
                                 f"{batch_size=}, {image_dims=}, {use_bias=}, {use_maxpool=}"
