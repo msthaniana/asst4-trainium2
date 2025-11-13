@@ -101,7 +101,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             # Height tiles
             for h in nl.affine_range(n_tiles_height):
                 # Allocate result tensor in PSUM
-                res_psum = nl.zeros((c_out_pmax, h_tile_size * out_width), dtype=X.dtype, buffer=nl.psum)
+                res_psum = nl.zeros((c_out_pmax, h_tile_size * out_width), dtype=nl.float32, buffer=nl.psum)
 
                 for c in nl.sequential_range(n_tiles_c_in):
                     # Copy image from HBM -> SBUF
