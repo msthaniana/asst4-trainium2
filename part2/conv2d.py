@@ -67,13 +67,15 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Various tiling dimensions (You may want to define more of them)
     c_in_pmax = nl.tile_size.pmax
     n_tiles_c_in = in_channels // c_in_pmax
+    c_out_pmax = nl.tile_size.pmax; # FIXME check whether this is true
+    n_tiles_c_out = out_channels // c_out_pmax
 
-    # Reshape images in X - does this work right?
+    # Reshape images in X
     X_re = X.reshape((batch_size, in_channels, input_height*input_width))
 
     # Copy weights from HBM -> SBUF
-    weights_sbuf = nl.ndarray((out_channels, in_channels, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(src=W, dst=weights_sbuf)
+    #weights_sbuf = nl.ndarray((out_channels, in_channels, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+    #nisa.dma_copy(src=W, dst=weights_sbuf)
 
     # Print config information
     print(" ")
@@ -83,43 +85,42 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     # Process the images in batches
     for b in nl.affine_range(batch_size):
-        # Copy image from HBM -> SBUF
-        image_sbuf = nl.ndarray((in_channels, input_height * out_width), dtype=X.dtype, buffer=nl.sbuf)#input_height long since that is easier to index at a later step
+        for c_out in nl.affine_range(n_tiles_c_out):
+            # Copy weights for this set of out channels - TODO only moving this inside loop because of partition dimension error
+            weights_sbuf = nl.ndarray((c_out_pmax, in_channels, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(src=W[c_out*c_out_pmax:(c_out+1)*c_out_pmax,:,:,:], dst=weights_sbuf)
 
-        # Allocate result tensor in PSUM
-        res_psum = nl.zeros((out_channels, out_height * out_width), dtype=X.dtype, buffer=nl.psum)
+            # Allocate result tensor in PSUM
+            res_psum = nl.zeros((c_out_pmax, out_height * out_width), dtype=X.dtype, buffer=nl.psum)
 
-        # Iterate over every element of the filter
-        for j in nl.sequential_range(filter_width):
-            #shift the image everytime we move the width #Likely very inefficient but maybe a good starting point.
-            for r in nl.affine_range(input_height):
-                nisa.dma_copy(src=X_re[b,:,(r*input_width+j):(r*input_width+j+out_width)], dst=image_sbuf[:,(r*(out_width)):(r*(out_width)+out_width)])#this is leading us to require the j to be sequential
+            for c in nl.sequential_range(n_tiles_c_in):
+                # Copy image from HBM -> SBUF
+                image_sbuf = nl.ndarray((c_in_pmax, input_height * out_width), dtype=X.dtype, buffer=nl.sbuf)
 
-            for i in nl.affine_range(filter_height):
-                # Generate weights matrix
-                # this is an attempt to pick out one set of elements from each filter, and then transpose to get
-                # the right dimensions for nc_matmul
+                # Iterate over every element of the filter
+                for j in nl.sequential_range(filter_width):
+                    #shift the image everytime we move the width #Likely very inefficient but maybe a good starting point.
+                    for r in nl.affine_range(input_height):
+                        nisa.dma_copy(src=X_re[b,c*c_in_pmax:(c+1)*c_in_pmax,(r*input_width+j):(r*input_width+j+out_width)],
+                                dst=image_sbuf[:,r*out_width:(r+1)*out_width])
 
-                #For larger arrays may be smarter to do this loop before these loops and save the transposed version of W. TODO Later. 
-                weights_ij  = weights_sbuf[:,:,i,j]
-                weights_ijT = nisa.nc_transpose(weights_ij)
-                weights_ijT_sbuf = nisa.tensor_copy(weights_ijT)
+                    for i in nl.affine_range(filter_height):
+                        # Generate weights matrix
+                        weights_ij  = weights_sbuf[:, c*c_in_pmax:(c+1)*c_in_pmax, i, j]
+                        weights_ijT = nisa.nc_transpose(weights_ij)
+                        weights_ijT_sbuf = nisa.tensor_copy(weights_ijT)
 
-                # Shift input image - not sure if this flattened filter approach works
-                image_sbuf_row_start = i*out_width
-                image_sbuf_row_end   = image_sbuf_row_start + out_height * out_width
-                res_psum += nisa.nc_matmul( weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
+                        # Shift input image - not sure if this flattened filter approach works
+                        image_sbuf_row_start = i*out_width
+                        image_sbuf_row_end   = image_sbuf_row_start + out_height * out_width
+                        res_psum += nisa.nc_matmul( weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
 
-        # Move result to SBUF
-        res_sbuf = nisa.tensor_copy(res_psum)
+            print("res_psum shape =", res_psum.shape)
 
-        # Transpose result to get [out_channels, out_height * out_width]
-        # res_psum_T = nisa.nc_transpose(res_sbuf)
+            # Move result to SBUF
+            res_sbuf = nisa.tensor_copy(res_psum)
 
-        # Move result to SBUF
-        # res_sbuf_T = nisa.tensor_copy(res_psum_T)
-
-        # Move result to HBM
-        nisa.dma_copy(src=res_sbuf, dst=X_out[b,:,:]) #do the reshape at the absolute end
+            # Move result to HBM
+            nisa.dma_copy(src=res_sbuf, dst=X_out[b,c_out*c_out_pmax:(c_out+1)*c_out_pmax,:])
 
     return X_out.reshape((batch_size, out_channels, out_pool_height, out_pool_width))

@@ -48,11 +48,11 @@ def test_correctness_conv2d_kernel(
         kernel = baremetal(kernel)
     ref_impl = conv2d_cpu_torch
 
-    input_channels_list = [128] #TODO: revert back to original. Only for testing
-    output_channels_list = [128] #TODO: revert back to original. Only for testing
+    input_channels_list = [128, 256, 512]
+    output_channels_list = [128, 256, 512]
     kernel_size_list = [3]
     batch_size_list = [4]
-    image_dims_list = [(16, 8), (32, 16)]
+    image_dims_list = [(32, 16)]
     pool_size = 2 if use_maxpool else 1
 
     if use_larger_images:
