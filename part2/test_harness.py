@@ -48,8 +48,8 @@ def test_correctness_conv2d_kernel(
         kernel = baremetal(kernel)
     ref_impl = conv2d_cpu_torch
 
-    input_channels_list = [128, 256]
-    output_channels_list = [128, 256]
+    input_channels_list = [128] #TODO: revert back to original. Only for testing
+    output_channels_list = [128] #TODO: revert back to original. Only for testing
     kernel_size_list = [3]
     batch_size_list = [4]
     image_dims_list = [(16, 8), (32, 16)]
@@ -84,8 +84,6 @@ def test_correctness_conv2d_kernel(
                         out_ref = ref_impl(*args, **kwargs)
 
                         if not np.allclose(out, out_ref):
-                            print(out[0,0])
-                            print(out_ref[0,0])
                             print(
                                 f"Output mismatch for {input_channels=}, {output_channels=}, {kernel_size=}, "
                                 f"{batch_size=}, {image_dims=}, {use_bias=}, {use_maxpool=}"

@@ -84,15 +84,17 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     # Process the images in batches
     for b in nl.affine_range(batch_size):
         # Copy image from HBM -> SBUF
-        image_sbuf = nl.ndarray((in_channels, input_height * input_width), dtype=X.dtype, buffer=nl.sbuf)
-        nisa.dma_copy(src=X_re[b,:,:], dst=image_sbuf)
+        image_sbuf = nl.ndarray((in_channels, input_height * out_width), dtype=X.dtype, buffer=nl.sbuf)#input_height long since that is easier to index at a later step
 
         # Allocate result tensor in PSUM
-        res_psum = nl.zeros((out_height * out_width,out_channels), dtype=X.dtype, buffer=nl.psum)
+        res_psum = nl.zeros((out_channels, out_height * out_width), dtype=X.dtype, buffer=nl.psum)
 
-        current_input_width = input_width
         # Iterate over every element of the filter
-        for j in nl.affine_range(filter_width):
+        for j in nl.sequential_range(filter_width):
+            #shift the image everytime we move the width #Likely very inefficient but maybe a good starting point.
+            for r in nl.affine_range(input_height):
+                nisa.dma_copy(src=X_re[b,:,(r*input_width+j):(r*input_width+j+out_width)], dst=image_sbuf[:,(r*(out_width)):(r*(out_width)+out_width)])#this is leading us to require the j to be sequential
+
             for i in nl.affine_range(filter_height):
                 # Generate weights matrix
                 # this is an attempt to pick out one set of elements from each filter, and then transpose to get
@@ -104,30 +106,20 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 weights_ijT_sbuf = nisa.tensor_copy(weights_ijT)
 
                 # Shift input image - not sure if this flattened filter approach works
-                image_sbuf_row_start = i*current_input_width
+                image_sbuf_row_start = i*out_width
                 image_sbuf_row_end   = image_sbuf_row_start + out_height * out_width
-                res_psum += nisa.nc_matmul( image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end], weights_ijT_sbuf) #input already in transposed format
-            
-            #shift the image everytime we move the width #Likely very inefficient but maybe a good starting point.
-            next_input_width = current_input_width - 1
-            for r in nl.affine_range(input_height):
-                # image_sbuf[:,(r*(next_input_width)):((r+1)*(next_input_width))] = image_sbuf[:,(r*current_input_width+j):(r*current_input_width+current_input_width)]
-                #slicing in ranges does not work at all in the nki system hence specific values to be used
-                for c in nl.affine_range(next_input_width):
-                    image_sbuf[:,(r*(next_input_width)+c)] = image_sbuf[:,(r*current_input_width+1+c)] #image buffer itself is updated to move right by 1
-            
-            current_input_width = next_input_width
+                res_psum += nisa.nc_matmul( weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
 
         # Move result to SBUF
         res_sbuf = nisa.tensor_copy(res_psum)
 
         # Transpose result to get [out_channels, out_height * out_width]
-        res_psum_T = nisa.nc_transpose(res_sbuf)
+        # res_psum_T = nisa.nc_transpose(res_sbuf)
 
         # Move result to SBUF
-        res_sbuf_T = nisa.tensor_copy(res_psum_T)
+        # res_sbuf_T = nisa.tensor_copy(res_psum_T)
 
         # Move result to HBM
-        nisa.dma_copy(src=res_sbuf_T, dst=X_out[b,:,:]) #do the reshape at the absolute end
+        nisa.dma_copy(src=res_sbuf, dst=X_out[b,:,:]) #do the reshape at the absolute end
 
     return X_out.reshape((batch_size, out_channels, out_pool_height, out_pool_width))
