@@ -94,14 +94,19 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
         # Process the images in batches
         for b in nl.affine_range(batch_size):
+            pool_res = nl.ndarray((c_out_pmax, out_pool_height, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
             # Height tiles
             for h in nl.affine_range(n_tiles_height):
                 # Allocate result tensor in PSUM
                 res_psum = nl.zeros((c_out_pmax, h_tile_size * out_width), dtype=nl.float32, buffer=nl.psum)
 
-                for c in nl.sequential_range(n_tiles_c_in):
+                for c in nl.affine_range(n_tiles_c_in):
                     # Copy image from HBM -> SBUF
                     image_sbuf = nl.ndarray((c_in_pmax, (h_tile_size+filter_height-1) * out_width), dtype=X.dtype, buffer=nl.sbuf)
+                    
+                    # sbuf =>sbuf case
+                    # image_sbuf_initial = nl.ndarray((c_in_pmax, input_height * input_width), dtype=X.dtype, buffer=nl.sbuf)
+                    # nisa.dma_copy(src=X_re[b,c*c_in_pmax:(c+1)*c_in_pmax], dst=image_sbuf_initial)
 
                     # Iterate over every element of the filter
                     for j in nl.sequential_range(filter_width):
@@ -109,6 +114,10 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         for r in nl.affine_range(h_tile_size+filter_height-1):
                             nisa.dma_copy(src=X_re[b,c*c_in_pmax:(c+1)*c_in_pmax,(r+h*h_tile_size)*input_width+j:(r+h*h_tile_size)*input_width+j+out_width],
                                     dst=image_sbuf[:,r*out_width:(r+1)*out_width])
+                            
+                            # #sbuf=>sbuf = worse perf
+                            # nisa.dma_copy(src=image_sbuf_initial[:,(r+h*h_tile_size)*input_width+j:(r+h*h_tile_size)*input_width+j+out_width],
+                            #         dst=image_sbuf[:,r*out_width:(r+1)*out_width])
 
                         for i in nl.affine_range(filter_height):
                             # Generate weights matrix
@@ -121,25 +130,19 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             image_sbuf_row_end   = image_sbuf_row_start + h_tile_size * out_width
                             res_psum += nisa.nc_matmul( weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
 
-                # Move result to SBUF
-                res_sbuf = nisa.tensor_copy(res_psum)
 
-                # Add bias to result
-                res_sbuf = nisa.tensor_tensor(res_sbuf, bias_sbuf, nl.add)
+                # Add bias to result #TODO: can this be done after the max_pool? Ideally no but could be done in our assignment I think 
+                res_sbuf = nisa.tensor_tensor(res_psum, bias_sbuf, nl.add)
 
                 # Reshape to apply max_pool locality
                 res_sbuf_re = res_sbuf.reshape((c_out_pmax, h_tile_size, out_width))
 
-                # Max Pool operation
-                pool_res = nl.ndarray((c_out_pmax, h_tile_size // pool_size, out_width // pool_size), dtype=X.dtype, buffer=nl.sbuf)
-                if (pool_size == 2):
-                    for i in nl.affine_range(h_tile_size // pool_size):
-                        for j in nl.affine_range(out_width // pool_size):
-                            pool_res[:,i:i+1,j:j+1] = nisa.tensor_reduce(nl.max, res_sbuf_re[:,i*pool_size:(i+1)*pool_size,j*pool_size:(j+1)*pool_size], axis=[1,2])
-                else:
-                    pool_res = res_sbuf_re
+                if (pool_size == 1):
+                    pool_res[:,h*h_tile_size:h*h_tile_size+h_tile_size,] = res_sbuf_re
+                else: #should work for any non-one pool size
+                    res_sbuf_re2 = res_sbuf.reshape((c_out_pmax, h_tile_size/pool_size, pool_size, out_width/pool_size, pool_size))
+                    pool_res[:,h:h+1,:] = nisa.tensor_reduce(nl.max, res_sbuf_re2, axis=[2,4])
 
-                # Move result to HBM
-                nisa.dma_copy(src=pool_res, dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax, (h*h_tile_size//pool_size):((h+1)*h_tile_size//pool_size), :])
+            nisa.dma_copy(src=pool_res, dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax,:, :])
 
     return X_out
