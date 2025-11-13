@@ -65,10 +65,13 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     )
 
     # Various tiling dimensions (You may want to define more of them)
-    c_in_pmax = nl.tile_size.pmax
-    n_tiles_c_in = in_channels // c_in_pmax
-    c_out_pmax = nl.tile_size.pmax; # FIXME check whether this is true
-    n_tiles_c_out = out_channels // c_out_pmax
+    c_in_pmax   = nl.tile_size.pmax
+    c_out_pmax  = nl.tile_size.pmax # FIXME check whether this is true
+    h_tile_size = 2 # FIXME need to increase this and account for boundary conditions
+
+    n_tiles_c_in    = in_channels // c_in_pmax
+    n_tiles_c_out   = out_channels // c_out_pmax
+    n_tiles_height  = out_height // h_tile_size
 
     # Reshape images in X
     X_re = X.reshape((batch_size, in_channels, input_height*input_width))
@@ -83,44 +86,53 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
     print("W dimensions: out_channels=", out_channels, "in_channels=", in_channels, "filter_height=", filter_height, "filter_width=", filter_width)
     print("X_out dimensions: batch_size=", batch_size, "out_channels=", out_channels, "out_pool_height=", out_pool_height, "out_pool_width=", out_pool_width)
 
-    # Process the images in batches
-    for b in nl.affine_range(batch_size):
-        for c_out in nl.affine_range(n_tiles_c_out):
-            # Copy weights for this set of out channels - TODO only moving this inside loop because of partition dimension error
-            weights_sbuf = nl.ndarray((c_out_pmax, in_channels, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(src=W[c_out*c_out_pmax:(c_out+1)*c_out_pmax,:,:,:], dst=weights_sbuf)
+    # First iterate over every chunk of output tiles independently
+    for c_out in nl.affine_range(n_tiles_c_out):
+        # Copy weights for this set of output channels
+        weights_sbuf = nl.ndarray((c_out_pmax, in_channels, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(src=W[c_out*c_out_pmax:(c_out+1)*c_out_pmax,:,:,:], dst=weights_sbuf)
 
-            # Allocate result tensor in PSUM
-            res_psum = nl.zeros((c_out_pmax, out_height * out_width), dtype=X.dtype, buffer=nl.psum)
+        # Copy bias for this set of output channels
+        bias_sbuf = nl.ndarray((c_out_pmax, 1), dtype=bias.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(src=bias[c_out*c_out_pmax:(c_out+1)*c_out_pmax,], dst=bias_sbuf)
 
-            for c in nl.sequential_range(n_tiles_c_in):
-                # Copy image from HBM -> SBUF
-                image_sbuf = nl.ndarray((c_in_pmax, input_height * out_width), dtype=X.dtype, buffer=nl.sbuf)
+        # Process the images in batches
+        for b in nl.affine_range(batch_size):
+            # Height tiles
+            for h in nl.affine_range(n_tiles_height):
+                # Allocate result tensor in PSUM
+                res_psum = nl.zeros((c_out_pmax, h_tile_size * out_width), dtype=X.dtype, buffer=nl.psum)
 
-                # Iterate over every element of the filter
-                for j in nl.sequential_range(filter_width):
-                    #shift the image everytime we move the width #Likely very inefficient but maybe a good starting point.
-                    for r in nl.affine_range(input_height):
-                        nisa.dma_copy(src=X_re[b,c*c_in_pmax:(c+1)*c_in_pmax,(r*input_width+j):(r*input_width+j+out_width)],
-                                dst=image_sbuf[:,r*out_width:(r+1)*out_width])
+                for c in nl.sequential_range(n_tiles_c_in):
+                    # Copy image from HBM -> SBUF
+                    image_sbuf = nl.ndarray((c_in_pmax, (h_tile_size+filter_height-1) * out_width), dtype=X.dtype, buffer=nl.sbuf)
 
-                    for i in nl.affine_range(filter_height):
-                        # Generate weights matrix
-                        weights_ij  = weights_sbuf[:, c*c_in_pmax:(c+1)*c_in_pmax, i, j]
-                        weights_ijT = nisa.nc_transpose(weights_ij)
-                        weights_ijT_sbuf = nisa.tensor_copy(weights_ijT)
+                    # Iterate over every element of the filter
+                    for j in nl.sequential_range(filter_width):
+                        #shift the image everytime we move the width #Likely very inefficient but maybe a good starting point.
+                        for r in nl.affine_range(h_tile_size+filter_height-1):
+                            nisa.dma_copy(src=X_re[b,c*c_in_pmax:(c+1)*c_in_pmax,(r+h*h_tile_size)*input_width+j:(r+h*h_tile_size)*input_width+j+out_width],
+                                    dst=image_sbuf[:,r*out_width:(r+1)*out_width])
 
-                        # Shift input image - not sure if this flattened filter approach works
-                        image_sbuf_row_start = i*out_width
-                        image_sbuf_row_end   = image_sbuf_row_start + out_height * out_width
-                        res_psum += nisa.nc_matmul( weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
+                        for i in nl.affine_range(filter_height):
+                            # Generate weights matrix
+                            weights_ij  = weights_sbuf[:, c*c_in_pmax:(c+1)*c_in_pmax, i, j]
+                            weights_ijT = nisa.nc_transpose(weights_ij)
+                            weights_ijT_sbuf = nisa.tensor_copy(weights_ijT)
 
-            print("res_psum shape =", res_psum.shape)
+                            # Shift input image - not sure if this flattened filter approach works
+                            image_sbuf_row_start = i*out_width
+                            image_sbuf_row_end   = image_sbuf_row_start + h_tile_size * out_width
+                            res_psum += nisa.nc_matmul( weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
 
-            # Move result to SBUF
-            res_sbuf = nisa.tensor_copy(res_psum)
+                # Move result to SBUF
+                res_sbuf = nisa.tensor_copy(res_psum)
 
-            # Move result to HBM
-            nisa.dma_copy(src=res_sbuf, dst=X_out[b,c_out*c_out_pmax:(c_out+1)*c_out_pmax,:])
+                # Add bias to result
+                res_sbuf = nisa.tensor_tensor(res_sbuf, bias_sbuf, nl.add)
+
+                # Move result to HBM
+                nisa.dma_copy(src=res_sbuf, dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax,
+                    h*h_tile_size*out_width:(h+1)*h_tile_size*out_width])
 
     return X_out.reshape((batch_size, out_channels, out_pool_height, out_pool_width))
