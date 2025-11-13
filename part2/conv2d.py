@@ -59,7 +59,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     # Initialize output array
     X_out = nl.ndarray(
-        shape=(batch_size, out_channels, out_pool_height*out_pool_width),
+        shape=(batch_size, out_channels, out_pool_height, out_pool_width),
         dtype=X.dtype,
         buffer=nl.hbm,
     )
@@ -75,10 +75,6 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     # Reshape images in X
     X_re = X.reshape((batch_size, in_channels, input_height*input_width))
-
-    # Copy weights from HBM -> SBUF
-    #weights_sbuf = nl.ndarray((out_channels, in_channels, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
-    #nisa.dma_copy(src=W, dst=weights_sbuf)
 
     # Print config information
     print(" ")
@@ -131,8 +127,19 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                 # Add bias to result
                 res_sbuf = nisa.tensor_tensor(res_sbuf, bias_sbuf, nl.add)
 
-                # Move result to HBM
-                nisa.dma_copy(src=res_sbuf, dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax,
-                    h*h_tile_size*out_width:(h+1)*h_tile_size*out_width])
+                # Reshape to apply max_pool locality
+                res_sbuf_re = res_sbuf.reshape((c_out_pmax, h_tile_size, out_width))
 
-    return X_out.reshape((batch_size, out_channels, out_pool_height, out_pool_width))
+                # Max Pool operation
+                pool_res = nl.ndarray((c_out_pmax, h_tile_size // pool_size, out_width // pool_size), dtype=X.dtype, buffer=nl.sbuf)
+                if (pool_size == 2):
+                    for i in nl.affine_range(h_tile_size // pool_size):
+                        for j in nl.affine_range(out_width // pool_size):
+                            pool_res[:,i:i+1,j:j+1] = nisa.tensor_reduce(nl.max, res_sbuf_re[:,i*pool_size:(i+1)*pool_size,j*pool_size:(j+1)*pool_size], axis=[1,2])
+                else:
+                    pool_res = res_sbuf_re
+
+                # Move result to HBM
+                nisa.dma_copy(src=pool_res, dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax, (h*h_tile_size//pool_size):((h+1)*h_tile_size//pool_size), :])
+
+    return X_out
