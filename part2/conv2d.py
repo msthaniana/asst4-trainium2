@@ -88,6 +88,16 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         weights_sbuf = nl.ndarray((c_out_pmax, in_channels, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
         nisa.dma_copy(src=W[c_out*c_out_pmax:(c_out+1)*c_out_pmax,:,:,:], dst=weights_sbuf)
 
+        #Generate a weight matrix that is transposed
+        weights_ijT_sbuf = nl.ndarray((c_out_pmax, c_in_pmax, n_tiles_c_in, filter_height, filter_width), dtype=W.dtype, buffer=nl.sbuf)
+        for c in nl.affine_range(n_tiles_c_in):
+            for j in nl.affine_range(filter_width):
+                for i in nl.affine_range(filter_height):
+                    weights_ijT = nisa.nc_transpose(weights_sbuf[:, c*c_in_pmax:(c+1)*c_in_pmax, i, j])
+                    weights_ijT_sbuf[:,:,c,i,j] = nisa.tensor_copy(weights_ijT)
+
+
+
         # Copy bias for this set of output channels
         bias_sbuf = nl.ndarray((c_out_pmax, 1), dtype=bias.dtype, buffer=nl.sbuf)
         nisa.dma_copy(src=bias[c_out*c_out_pmax:(c_out+1)*c_out_pmax,], dst=bias_sbuf)
@@ -95,6 +105,12 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         # Process the images in batches
         for b in nl.affine_range(batch_size):
             pool_res = nl.ndarray((c_out_pmax, out_pool_height, out_pool_width), dtype=X.dtype, buffer=nl.sbuf)
+            
+            # sbuf =>sbuf case - this would be qite ideal but does not fit
+            # image_sbuf_initial = nl.ndarray((c_in_pmax, n_tiles_c_in, input_height * input_width), dtype=X.dtype, buffer=nl.sbuf)
+            # for c in nl.affine_range(n_tiles_c_in):
+            #     nisa.dma_copy(src=X_re[b,c*c_in_pmax:(c+1)*c_in_pmax], dst=image_sbuf_initial[:,c,:])
+            
             # Height tiles
             for h in nl.affine_range(n_tiles_height):
                 # Allocate result tensor in PSUM
@@ -120,26 +136,22 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             #         dst=image_sbuf[:,r*out_width:(r+1)*out_width])
 
                         for i in nl.affine_range(filter_height):
-                            # Generate weights matrix
-                            weights_ij  = weights_sbuf[:, c*c_in_pmax:(c+1)*c_in_pmax, i, j]
-                            weights_ijT = nisa.nc_transpose(weights_ij)
-                            weights_ijT_sbuf = nisa.tensor_copy(weights_ijT)
 
                             # Shift input image - not sure if this flattened filter approach works
                             image_sbuf_row_start = i*out_width
                             image_sbuf_row_end   = image_sbuf_row_start + h_tile_size * out_width
-                            res_psum += nisa.nc_matmul( weights_ijT_sbuf, image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
+                            res_psum += nisa.nc_matmul( weights_ijT_sbuf[:,:,c,i,j], image_sbuf[:, image_sbuf_row_start:image_sbuf_row_end]) #input already in transposed format
 
 
                 # Add bias to result #TODO: can this be done after the max_pool? Ideally no but could be done in our assignment I think 
                 res_sbuf = nisa.tensor_tensor(res_psum, bias_sbuf, nl.add)
 
-                # Reshape to apply max_pool locality
-                res_sbuf_re = res_sbuf.reshape((c_out_pmax, h_tile_size, out_width))
-
                 if (pool_size == 1):
+                    # Reshape to apply max_pool locality
+                    res_sbuf_re = res_sbuf.reshape((c_out_pmax, h_tile_size, out_width))
                     pool_res[:,h*h_tile_size:h*h_tile_size+h_tile_size,] = res_sbuf_re
                 else: #should work for any non-one pool size
+                    # Reshape to apply max_pool locality
                     res_sbuf_re2 = res_sbuf.reshape((c_out_pmax, h_tile_size/pool_size, pool_size, out_width/pool_size, pool_size))
                     pool_res[:,h:h+1,:] = nisa.tensor_reduce(nl.max, res_sbuf_re2, axis=[2,4])
 
