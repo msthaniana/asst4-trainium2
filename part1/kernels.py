@@ -149,16 +149,16 @@ def matrix_transpose(a_tensor):
 
     # TODO: Your implementation here. The only compute instruction you should use is `nisa.nc_transpose`.
     for r in nl.affine_range(M // tile_dim):
-        for c in nl.affine_range(N // tile_dim):
+        #allocate space for a tile
+        a_tile = nl.ndarray((tile_dim, N), dtype=a_tensor.dtype, buffer=nl.sbuf)
         
-            #allocate space for a tile
-            a_tile = nl.ndarray((tile_dim, tile_dim), dtype=a_tensor.dtype, buffer=nl.sbuf)
-            
-            #move a_tensor to sbuffer
-            nisa.dma_copy(src=a_tensor[r * tile_dim : (r + 1) * tile_dim, c * tile_dim : (c + 1) * tile_dim], dst=a_tile)
+        #move a_tensor to sbuffer
+        nisa.dma_copy(src=a_tensor[r * tile_dim : (r + 1) * tile_dim, :], dst=a_tile)
+
+        for c in nl.affine_range(N // tile_dim):
 
             #do transpose
-            aT = nisa.nc_transpose(a_tile)
+            aT = nisa.nc_transpose(a_tile[:,tile_dim*c:tile_dim*(c+1)])
 
             #move aT to sbuffer
             a_copy = nisa.tensor_copy(aT)
