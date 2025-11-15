@@ -122,6 +122,8 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                     res_sbuf_re2 = res_sbuf.reshape((c_out_pmax, h_tile_size/pool_size, pool_size, out_width/pool_size, pool_size))
                     pool_res[:,h:h+1,:] = nisa.tensor_reduce(nl.max, res_sbuf_re2, axis=[2,4])
 
-            nisa.dma_copy(src=pool_res, dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax,:, :])
+            # Split dma_copy SBUF->HBM into 2 due to large image size
+            nisa.dma_copy(src=pool_res[:,0:(out_pool_height//2),:], dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax,0:(out_pool_height//2),:])
+            nisa.dma_copy(src=pool_res[:,out_pool_height//2:out_pool_height,:], dst=X_out[b, c_out*c_out_pmax:(c_out+1)*c_out_pmax,out_pool_height//2:out_pool_height,:])
 
     return X_out
